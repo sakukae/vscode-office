@@ -709,12 +709,12 @@ function getOutlineViewportState(vditor, source) {
   }
 
   const isPreview = vditor.preview?.element?.contains?.(source)
-  const topOffset = isPreview ? 16 : 24
+  const scrollTop = container.scrollTop
   return {
-    topBoundary: container.scrollTop + topOffset,
+    scrollTop,
+    bottomBoundary: scrollTop + container.clientHeight,
     container,
     mode: isPreview ? "preview" : "editor",
-    topOffset,
   }
 }
 
@@ -845,7 +845,16 @@ function findActiveHeading(headingMetrics, viewportState) {
     return null
   }
 
-  const boundaryTop = viewportState.topBoundary
+  const visibleHeadings = positions.filter(({ top }) => (
+    top >= viewportState.scrollTop &&
+    top < viewportState.bottomBoundary
+  ))
+
+  if (visibleHeadings.length > 0) {
+    return visibleHeadings[0]?.element || null
+  }
+
+  const boundaryTop = viewportState.scrollTop
   let low = 0
   let high = positions.length
 
@@ -858,13 +867,31 @@ function findActiveHeading(headingMetrics, viewportState) {
     }
   }
 
-  const nextIndex = low
-  let activeIndex = Math.max(0, nextIndex - 1)
-  if (nextIndex < positions.length && positions[nextIndex].top - boundaryTop < 32) {
-    activeIndex = nextIndex
+  const activeIndex = low > 0 ? low - 1 : 0
+  return positions[activeIndex]?.element || null
+}
+
+function updateActiveOutlineRow(vditor, rowsById, activeId, options = {}) {
+  const previousActiveId = vditor?.__outlineActiveId || null
+  if (previousActiveId && previousActiveId !== activeId) {
+    rowsById.get(previousActiveId)?.classList.remove(OUTLINE_ACTIVE_CLASS)
+  }
+  if (!activeId && previousActiveId) {
+    rowsById.get(previousActiveId)?.classList.remove(OUTLINE_ACTIVE_CLASS)
   }
 
-  return positions[activeIndex]?.element || null
+  const activeRow = activeId ? rowsById.get(activeId) || null : null
+  if (activeRow) {
+    activeRow.classList.add(OUTLINE_ACTIVE_CLASS)
+  }
+
+  vditor.__outlineActiveId = activeId || null
+
+  if (options.scrollIntoView && activeRow && activeId && activeId !== previousActiveId) {
+    activeRow.scrollIntoView({ block: "nearest", inline: "nearest" })
+  }
+
+  return activeRow
 }
 
 function syncActiveOutlineHeading(vditor) {
@@ -883,25 +910,8 @@ function syncActiveOutlineHeading(vditor) {
   const headingMetrics = getOutlineHeadingMetrics(trackingState, viewportState)
   const activeHeading = findActiveHeading(headingMetrics, viewportState)
   const activeId = activeHeading?.id
-  const previousActiveId = vditor.__outlineActiveId || null
   const rowsById = trackingState.rowsById
-  const activeRow = activeId ? rowsById.get(activeId) || null : null
-
-  if (previousActiveId && previousActiveId !== activeId) {
-    rowsById.get(previousActiveId)?.classList.remove(OUTLINE_ACTIVE_CLASS)
-  }
-  if (!activeId && previousActiveId) {
-    rowsById.get(previousActiveId)?.classList.remove(OUTLINE_ACTIVE_CLASS)
-  }
-  if (activeRow) {
-    activeRow.classList.add(OUTLINE_ACTIVE_CLASS)
-  }
-
-  vditor.__outlineActiveId = activeId || null
-
-  if (activeRow && activeId && activeId !== previousActiveId) {
-    activeRow.scrollIntoView({ block: "nearest", inline: "nearest" })
-  }
+  updateActiveOutlineRow(vditor, rowsById, activeId, { scrollIntoView: true })
 }
 
 function collectOutlineHeadings(root) {
@@ -1063,7 +1073,11 @@ function handleOutlineClick(event, vditor) {
 
   event.preventDefault()
   event.stopPropagation()
+  if (trackingState?.rowsById) {
+    updateActiveOutlineRow(vditor, trackingState.rowsById, targetId)
+  }
   scrollOutlineTarget(target, source, vditor)
+  requestOutlineSync(vditor, { invalidateMetrics: true })
 }
 
 function scrollOutlineTarget(target, source, vditor) {

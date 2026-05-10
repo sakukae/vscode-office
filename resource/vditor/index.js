@@ -612,19 +612,23 @@ function patchOutline(editor) {
     const source = getOutlineSourceElement(currentVditor)
     if (!source) {
       content.innerHTML = ""
+      clearOutlineTrackingState(currentVditor)
       return ""
     }
 
     const headings = collectOutlineHeadings(source)
     if (headings.length === 0) {
       content.innerHTML = ""
+      clearOutlineTrackingState(currentVditor)
       return ""
     }
 
+    const rowsById = new Map()
     content.innerHTML = ""
-    content.appendChild(buildOutlineTree(headings))
+    content.appendChild(buildOutlineTree(headings, rowsById))
     content.onclick = (event) => handleOutlineClick(event, currentVditor)
-    queueMicrotask(() => syncActiveOutlineHeading(currentVditor))
+    setOutlineTrackingState(currentVditor, content, source, headings, rowsById)
+    queueMicrotask(() => requestOutlineSync(currentVditor, { invalidateMetrics: true }))
     return content.innerHTML
   }
 
@@ -637,14 +641,8 @@ function bindOutlineTracking(editor) {
     return
   }
 
-  const sync = () => syncActiveOutlineHeading(vditor)
-  const syncSoon = () => queueMicrotask(sync)
-  const syncSelection = () => {
-    if (!isOutlineSelectionInsideSource(vditor)) {
-      return
-    }
-    syncSoon()
-  }
+  const sync = () => requestOutlineSync(vditor)
+  const syncWithMetricRefresh = () => requestOutlineSync(vditor, { invalidateMetrics: true })
   const containers = new Set([
     getOutlineScrollContainer(vditor, getPreviewOutlineSourceElement(vditor)),
     getOutlineScrollContainer(vditor, resolveOutlineContentRoot(vditor.wysiwyg?.element)),
@@ -654,9 +652,8 @@ function bindOutlineTracking(editor) {
   containers.forEach((container) => {
     container?.addEventListener("scroll", sync, { passive: true })
   })
-  window.addEventListener("resize", sync, { passive: true })
-  document.addEventListener("selectionchange", syncSelection)
-  syncSoon()
+  window.addEventListener("resize", syncWithMetricRefresh, { passive: true })
+  syncWithMetricRefresh()
 
   vditor.__outlineTrackingBound = true
 }
@@ -701,17 +698,6 @@ function getOutlineScrollContainer(vditor, source) {
   return source.closest?.(".vditor-reset") || source
 }
 
-function isOutlineSelectionInsideSource(vditor) {
-  const selection = document.getSelection?.()
-  if (!selection?.rangeCount) {
-    return false
-  }
-
-  const anchorNode = selection.anchorNode
-  const source = getOutlineSourceElement(vditor)
-  return Boolean(anchorNode && source?.contains?.(anchorNode))
-}
-
 function getOutlineViewportState(vditor, source) {
   if (!vditor || !source) {
     return null
@@ -723,11 +709,12 @@ function getOutlineViewportState(vditor, source) {
   }
 
   const isPreview = vditor.preview?.element?.contains?.(source)
-  const rect = container.getBoundingClientRect()
+  const topOffset = isPreview ? 16 : 24
   return {
-    topBoundary: rect.top + (isPreview ? 16 : 24),
+    topBoundary: container.scrollTop + topOffset,
     container,
     mode: isPreview ? "preview" : "editor",
+    topOffset,
   }
 }
 
@@ -736,27 +723,148 @@ function collectVisibleOutlineHeadings(source) {
     .filter((heading) => heading.id)
 }
 
-function findActiveHeading(headings, viewportState) {
-  if (!headings.length || !viewportState) {
+function clearOutlineTrackingState(vditor) {
+  if (!vditor) {
+    return
+  }
+
+  if (vditor.__outlineSyncFrame) {
+    cancelAnimationFrame(vditor.__outlineSyncFrame)
+    vditor.__outlineSyncFrame = 0
+  }
+
+  vditor.__outlineTrackingState = null
+  vditor.__outlineActiveId = null
+}
+
+function setOutlineTrackingState(vditor, outlineContent, source, headings, rowsById = new Map()) {
+  if (!vditor || !outlineContent || !source) {
+    return
+  }
+
+  const headingItems = headings
+    .map((heading) => {
+      const element = heading?.element || heading
+      if (!element?.id) {
+        return null
+      }
+
+      return {
+        id: element.id,
+        element,
+      }
+    })
+    .filter(Boolean)
+
+  vditor.__outlineTrackingState = {
+    outlineContent,
+    source,
+    headings: headingItems,
+    headingById: new Map(headingItems.map((heading) => [heading.id, heading.element])),
+    rowsById,
+    metrics: null,
+  }
+}
+
+function collectOutlineRows(outlineContent) {
+  return Array.from(outlineContent?.querySelectorAll?.("[data-target-id]") || []).reduce((rowsById, row) => {
+    const targetId = row.getAttribute("data-target-id")
+    if (targetId) {
+      rowsById.set(targetId, row)
+    }
+    return rowsById
+  }, new Map())
+}
+
+function getOutlineTrackingState(vditor, source, outlineContent) {
+  if (!vditor || !source || !outlineContent) {
     return null
   }
 
-  let active = headings[0]
-
-  for (const heading of headings) {
-    const rect = heading.getBoundingClientRect()
-    if (rect.top <= viewportState.topBoundary) {
-      active = heading
-      continue
-    }
-
-    if (rect.top - viewportState.topBoundary < 32) {
-      active = heading
-    }
-    break
+  const trackingState = vditor.__outlineTrackingState
+  if (trackingState?.source === source && trackingState.outlineContent === outlineContent) {
+    return trackingState
   }
 
-  return active
+  setOutlineTrackingState(
+    vditor,
+    outlineContent,
+    source,
+    collectVisibleOutlineHeadings(source),
+    collectOutlineRows(outlineContent),
+  )
+  return vditor.__outlineTrackingState
+}
+
+function getOutlineHeadingMetrics(trackingState, viewportState) {
+  if (!trackingState || !viewportState) {
+    return null
+  }
+
+  const previousMetrics = trackingState.metrics
+  if (previousMetrics?.container === viewportState.container && previousMetrics.mode === viewportState.mode) {
+    return previousMetrics
+  }
+
+  const containerRect = viewportState.container.getBoundingClientRect()
+  trackingState.metrics = {
+    container: viewportState.container,
+    mode: viewportState.mode,
+    positions: trackingState.headings.map(({ id, element }) => ({
+      id,
+      element,
+      top: viewportState.container.scrollTop + (element.getBoundingClientRect().top - containerRect.top),
+    })),
+  }
+
+  return trackingState.metrics
+}
+
+function requestOutlineSync(vditor, options = {}) {
+  if (!vditor) {
+    return
+  }
+
+  if (options.invalidateMetrics && vditor.__outlineTrackingState) {
+    vditor.__outlineTrackingState.metrics = null
+  }
+
+  if (vditor.__outlineSyncFrame) {
+    return
+  }
+
+  vditor.__outlineSyncFrame = requestAnimationFrame(() => {
+    vditor.__outlineSyncFrame = 0
+    syncActiveOutlineHeading(vditor)
+  })
+}
+
+function findActiveHeading(headingMetrics, viewportState) {
+  const positions = headingMetrics?.positions || []
+  if (!positions.length || !viewportState) {
+    return null
+  }
+
+  const boundaryTop = viewportState.topBoundary
+  let low = 0
+  let high = positions.length
+
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    if (positions[middle].top <= boundaryTop) {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+
+  const nextIndex = low
+  let activeIndex = Math.max(0, nextIndex - 1)
+  if (nextIndex < positions.length && positions[nextIndex].top - boundaryTop < 32) {
+    activeIndex = nextIndex
+  }
+
+  return positions[activeIndex]?.element || null
 }
 
 function syncActiveOutlineHeading(vditor) {
@@ -766,22 +874,28 @@ function syncActiveOutlineHeading(vditor) {
   }
 
   const source = getOutlineSourceElement(vditor)
+  const trackingState = getOutlineTrackingState(vditor, source, outlineContent)
+  if (!trackingState) {
+    return
+  }
+
   const viewportState = getOutlineViewportState(vditor, source)
-  const headings = collectVisibleOutlineHeadings(source)
-  const activeHeading = findActiveHeading(headings, viewportState)
+  const headingMetrics = getOutlineHeadingMetrics(trackingState, viewportState)
+  const activeHeading = findActiveHeading(headingMetrics, viewportState)
   const activeId = activeHeading?.id
-
-  const rows = outlineContent.querySelectorAll("[data-target-id]")
-  let activeRow = null
   const previousActiveId = vditor.__outlineActiveId || null
+  const rowsById = trackingState.rowsById
+  const activeRow = activeId ? rowsById.get(activeId) || null : null
 
-  rows.forEach((row) => {
-    const isActive = activeId && row.getAttribute("data-target-id") === activeId
-    row.classList.toggle(OUTLINE_ACTIVE_CLASS, Boolean(isActive))
-    if (isActive) {
-      activeRow = row
-    }
-  })
+  if (previousActiveId && previousActiveId !== activeId) {
+    rowsById.get(previousActiveId)?.classList.remove(OUTLINE_ACTIVE_CLASS)
+  }
+  if (!activeId && previousActiveId) {
+    rowsById.get(previousActiveId)?.classList.remove(OUTLINE_ACTIVE_CLASS)
+  }
+  if (activeRow) {
+    activeRow.classList.add(OUTLINE_ACTIVE_CLASS)
+  }
 
   vditor.__outlineActiveId = activeId || null
 
@@ -806,7 +920,8 @@ function collectOutlineHeadings(root) {
       id,
       level,
       text: (element.textContent || "").replace(/\u200b/g, "").trim() || id,
-      content: createOutlineLabelContent(element)
+      content: createOutlineLabelContent(element),
+      element,
     })
   })
 
@@ -836,7 +951,7 @@ function ensureHeadingId(element, index) {
   return id
 }
 
-function buildOutlineTree(headings) {
+function buildOutlineTree(headings, rowsById) {
   const root = { level: 0, children: [] }
   const stack = [root]
 
@@ -849,16 +964,17 @@ function buildOutlineTree(headings) {
     stack.push(node)
   })
 
-  return buildOutlineList(root.children)
+  return buildOutlineList(root.children, rowsById)
 }
 
-function buildOutlineList(nodes) {
+function buildOutlineList(nodes, rowsById) {
   const list = document.createElement("ul")
 
   nodes.forEach((node) => {
     const item = document.createElement("li")
     const row = document.createElement("span")
     row.setAttribute("data-target-id", node.id)
+    rowsById?.set(node.id, row)
 
     const action = createOutlineAction(node.children.length > 0)
     const label = document.createElement("span")
@@ -873,7 +989,7 @@ function buildOutlineList(nodes) {
     item.appendChild(row)
 
     if (node.children.length > 0) {
-      item.appendChild(buildOutlineList(node.children))
+      item.appendChild(buildOutlineList(node.children, rowsById))
     }
 
     list.appendChild(item)
@@ -935,8 +1051,11 @@ function handleOutlineClick(event, vditor) {
   }
 
   const source = getOutlineSourceElement(vditor)
-  const target = source?.querySelector?.(`#${CSS.escape(targetRow.getAttribute("data-target-id"))}`) ||
-    document.getElementById(targetRow.getAttribute("data-target-id"))
+  const targetId = targetRow.getAttribute("data-target-id")
+  const trackingState = getOutlineTrackingState(vditor, source, vditor?.outline?.element?.lastElementChild)
+  const target = trackingState?.headingById.get(targetId) ||
+    source?.querySelector?.(`#${CSS.escape(targetId)}`) ||
+    document.getElementById(targetId)
 
   if (!target) {
     return

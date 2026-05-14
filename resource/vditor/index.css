@@ -114,3 +114,12 @@ mark.vscode-office-search-match--active {
     font-weight: 700;
     color: var(--vscode-editor-foreground, #111);
 }
+
+.vditor-wysiwyg .vscode-office-virtual-block {
+    contain: layout style paint;
+}
+
+.vditor-wysiwyg .vscode-office-virtual-block:not(.vscode-office-virtual-block--active) {
+    content-visibility: auto;
+    contain-intrinsic-size: var(--vscode-office-virtual-size, 160px);
+}

@@ -5,6 +5,9 @@ const TABLE_CODE_DOLLAR_PLACEHOLDER = "__VSCODE_OFFICE_VDITOR_TABLE_CODE_DOLLAR_
 const SEARCH_MATCH_CLASS = "vscode-office-search-match"
 const SEARCH_ACTIVE_CLASS = "vscode-office-search-match--active"
 const OUTLINE_ACTIVE_CLASS = "vscode-office-outline__item--active"
+const VIRTUAL_BLOCK_CLASS = "vscode-office-virtual-block"
+const VIRTUAL_BLOCK_ACTIVE_CLASS = "vscode-office-virtual-block--active"
+const VIRTUALIZATION_BUFFER_PX = 1200
 
 function loadConfigs() {
   const elem = document.getElementById('configs')
@@ -85,6 +88,7 @@ handler.on("open", async (md) => {
       patchLuteMarkdownTableCode(editor)
       restorePreparedMarkdownPlaceholders(editor)
       patchRenderedSetValue(editor)
+      bindWysiwygVirtualization(editor)
       patchOutline(editor)
       bindOutlineTracking(editor)
       createSearch(editor)
@@ -361,6 +365,7 @@ function patchRenderedSetValue(editor) {
     const result = originalSetValue(content, clearStack)
     queueMicrotask(() => {
       restorePreparedMarkdownPlaceholders(editor)
+      requestWysiwygVirtualizationRefresh(editor?.vditor, { invalidateMetrics: true })
       editor.vditor?.outline?.render?.(editor.vditor)
       window.vscodeOfficeSearch?.refresh()
     })
@@ -368,6 +373,102 @@ function patchRenderedSetValue(editor) {
   }
 
   editor.__renderedSetValuePatched = true
+}
+
+function bindWysiwygVirtualization(editor) {
+  const vditor = editor?.vditor
+  const root = resolveOutlineContentRoot(vditor?.wysiwyg?.element)
+  const container = getOutlineScrollContainer(vditor, root)
+  if (!vditor || !root || !container || vditor.__wysiwygVirtualizationBound) {
+    return
+  }
+
+  const schedule = (options = {}) => requestWysiwygVirtualizationRefresh(vditor, options)
+
+  container.addEventListener("scroll", () => schedule(), { passive: true })
+  root.addEventListener("input", () => schedule({ invalidateMetrics: true }))
+  root.addEventListener("click", () => schedule())
+  root.addEventListener("keyup", () => schedule())
+  window.addEventListener("resize", () => schedule({ invalidateMetrics: true }), { passive: true })
+  schedule({ invalidateMetrics: true })
+
+  vditor.__wysiwygVirtualizationBound = true
+}
+
+function getWysiwygVirtualizationState(vditor) {
+  if (!vditor) {
+    return null
+  }
+
+  if (!vditor.__wysiwygVirtualizationState) {
+    vditor.__wysiwygVirtualizationState = {
+      frame: 0,
+      needsMetricRefresh: false,
+    }
+  }
+
+  return vditor.__wysiwygVirtualizationState
+}
+
+function requestWysiwygVirtualizationRefresh(vditor, options = {}) {
+  const state = getWysiwygVirtualizationState(vditor)
+  if (!state) {
+    return
+  }
+
+  state.needsMetricRefresh = state.needsMetricRefresh || Boolean(options.invalidateMetrics)
+  if (state.frame) {
+    return
+  }
+
+  state.frame = requestAnimationFrame(() => {
+    state.frame = 0
+    refreshWysiwygVirtualization(vditor, { invalidateMetrics: state.needsMetricRefresh })
+    state.needsMetricRefresh = false
+  })
+}
+
+function refreshWysiwygVirtualization(vditor, options = {}) {
+  const root = resolveOutlineContentRoot(vditor?.wysiwyg?.element)
+  const container = getOutlineScrollContainer(vditor, root)
+  if (!root || !container) {
+    return
+  }
+
+  const selection = document.getSelection?.()
+  const anchorNode = selection?.anchorNode || null
+  const viewportTop = Math.max(0, container.scrollTop - VIRTUALIZATION_BUFFER_PX)
+  const viewportBottom = container.scrollTop + container.clientHeight + VIRTUALIZATION_BUFFER_PX
+  const blocks = Array.from(root.children || []).filter(shouldVirtualizeBlock)
+
+  blocks.forEach((block) => {
+    if (options.invalidateMetrics || !block.style.getPropertyValue("--vscode-office-virtual-size")) {
+      const height = Math.max(1, Math.ceil(block.getBoundingClientRect().height || block.offsetHeight || 0))
+      block.style.setProperty("--vscode-office-virtual-size", `${height}px`)
+    }
+
+    const blockTop = block.offsetTop
+    const blockHeight = block.offsetHeight || parseFloat(block.style.getPropertyValue("--vscode-office-virtual-size")) || 0
+    const isActive = (
+      blockTop + blockHeight >= viewportTop &&
+      blockTop <= viewportBottom
+    ) || Boolean(anchorNode && block.contains(anchorNode))
+
+    block.classList.add(VIRTUAL_BLOCK_CLASS)
+    block.classList.toggle(VIRTUAL_BLOCK_ACTIVE_CLASS, isActive)
+  })
+}
+
+function shouldVirtualizeBlock(block) {
+  if (!block || block.nodeType !== Node.ELEMENT_NODE) {
+    return false
+  }
+
+  if (block.tagName === "STYLE" || block.tagName === "SCRIPT") {
+    return false
+  }
+
+  return true
 }
 
 function patchLuteMarkdownTableCode(editor) {
